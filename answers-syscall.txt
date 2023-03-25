@@ -1,0 +1,147 @@
+## Lab 2  
+[Lab 2 官方文档](https://pdos.csail.mit.edu/6.828/2022/labs/syscall.html)  
+[xv6 源码](https://github.com/mit-pdos/xv6-public)  
+***
+在开始本Lab的操作前，先使用以下代码将git转至syscall分支：  
+```
+git fetch
+git checkout syscall
+make clean
+```
+***
+#### gdb  
+Lab 2的文档中提供了一份[关于使用gdb的文档](https://pdos.csail.mit.edu/6.828/2022/labs/gdb.html)，这里我采用的方法也借鉴了该文档。  
+首先在一个终端中输入`make qemu-gdb`，会生成一些奇怪的东西，以及提示你在另一个终端使用gdb的消息。  
+在另一个终端中，输入`gdb-multiarch -x .gdbinit`即可启动gdb，接下来在该终端输入Lab文档中的指令进行操作即可。  
+以下是按文档顺序进行操作得到结果的过程描述。  
+##### 初体验  
+第一段交互得到的命令行显示：  
+```
+(gdb) b syscall
+Breakpoint 1 at 0x80001fe0: file kernel/syscall.c, line 133.
+(gdb) c
+Continuing.
+[Switching to Thread 1.3]
+
+Thread 3 hit Breakpoint 1, syscall () at kernel/syscall.c:133
+133     {
+(gdb) layout src
+```
+输入到`layout src`指令后，窗口被分割为两个部分，上面是正在运行的源代码的直观展示，下面则是原本的命令行部分。  
+最后输入`(gdb) backtrace`，输出为函数堆栈上的记录。对于文档中的问题，由输出可知syscall由函数usertrap调用（只需找到目标上一层函数即可）。  
+##### 逐句执行  
+接下来连续输入n直到执行语句`struct proc *p = myproc();`，然后输入` p /x *p`，该命令获取并输出p目前存储的值。  
+![pic](res/p.PNG)
+可以从输出看到该结构体所有的成员以及情况。  
+现在想要得知`p->trapframe->a7`的值，可以从`user/initcode.S`的源码中找到该值声明的位置并从上述输出中读出该值，但更简单的办法是使用如下命令：  
+```
+(gdb) p p->trapframe->a7
+```
+简单的输出想要的结果。  
+由源码可以得知该值是将要执行的syscall的编号，而编号在`syscall.h`中与函数存在对应关系，此处的7对应的便是下图中的exec函数。  
+![pic](res/syscall.PNG)  
+##### 系统模式  
+输入`(gdb) p /x $sstatus`，得到一个输出值，该寄存器的值有关系统当前的所处模式，具体参考[这里](https://docs.keystone-enclave.org/en/latest/Getting-Started/How-Keystone-Works/RISC-V-Background.html#risc-v-privilieged-isa)。  
+这里有一张表明sstaus寄存器结构的图：  
+![pic](res/sstatus.png)
+输出有6位则说明是64位寄存器，我们关心的值是SPP处的值，该值表明了系统当前的模式，可以发现该值为0，表明系统目前处于`user mode`。  
+##### panic  
+此部分是希望体验一下内核函数`panic`的调用过程，我们故意把`syscall.c`中的函数改错，将原本的`num = p->trapframe->a7;`一行改为`num = * (int *) 0;`，跑到这里时将产生一个空指针异常。  
+此时使用`make qemu`命令会产生如下输出：  
+```
+scause 0x000000000000000d
+sepc=0x0000000080001ff4 stval=0x0000000000000000
+panic: kerneltrap
+```
+输出的sepc值与`kernel.asm`中的数字串非常相像，后者中的数字串其实对应着不同的汇编指令，[这里](https://web.eecs.utk.edu/~smarz1/courses/ece356/notes/assembly/)有关于risc-v中的汇编指令的描述。  
+在`kernel.asm`中直接搜索sepc对应的数字可以找到汇编指令：![pic](res/search.PNG)  
+上面给出的文档中可以发现lw应为`load word`指令，其用法见下图。  
+![pic](res/lw.PNG)  
+按指令对应的参数位置，该错误发生的位置正在于将地址在0开始的数据（长度一个word）写入a3寄存器中，而这一地址显然有误，符合我们一开始进行的`(int *)0`错误修改。  
+至于问题也好回答了，num正对应着此处的a3寄存器。  
+##### gdb解决问题  
+保持此处的错误，现在给gdb发挥的空间，启动gdb后输入：  
+```
+(gdb) b *0x0000000080001ff4
+Breakpoint 1 at 0x80001ff4: file kernel/syscall.c, line 137.
+(gdb) c
+Continuing.
+[Switching to Thread 1.3]
+
+Thread 3 hit Breakpoint 1, syscall () at kernel/syscall.c:137
+137       num = * (int *) 0;//p->trapframe->a7;
+(gdb) layout asm
+```
+分割的窗口中，上面的部分显示着目前的断点也即80001ff4处。  
+现在再输入一次n，会发现程序不响应了，而切换回另一个终端（输入make的终端）发现panic信息在此终端显示，也可以在原本的终端同时按Ctrl+c强行停止，然后输入`p $scause`，也能看到此时scause寄存器的值，两边的结果应该保持一致。此处得到的结果为13（另一边是0x00...0d）。  
+上面我们进行过关于sepc的探讨，但此处的疑问成了为什么系统会崩溃，虽然我们知道是因为对地址的错误访问，但0这一地址未必不合法，因此下面还要利用一下scause寄存器提供给我们的信息。  
+scause寄存器实际上存储该次错误的发生原因对应的状态码，此处有一张表格表示其内容与错误原因的对应关系：  
+![pic](res/scause.png)  
+interrupt值在系统触发中断时为1，此处的异常状态并非因调度产生的中断，应参考下面的部分（关于中断与异常等的关系详见[这里](https://th0ar.gitbooks.io/xv6-chinese/content/content/chapter3.html)）  
+13对应页表加载出错，这就涉及xv6系统中的地址与页表的关系了，[上面的文档的第二节](https://th0ar.gitbooks.io/xv6-chinese/content/content/chapter2.html)讲的就是页表相关内容，阅读之后可以发现，页表的建立基于虚拟内存和物理内存之间的映射，而xv6中的虚拟内存映射实际上从常量`KERNBASE`开始，也就是说，0这一内存并不在该映射的“定义域”中，从而产生错误。  
+这也就回答了上面说到的为何报错的问题：访问了一个并不存在（无法映射即不存在）的地址。  
+##### 更精细的debug：name  
+实际遇到问题时应该是一个完全没有头绪的状态，即便了解了上面出现的报错的原因，也未必能方便的找到问题所在，name可以直接获取到当前进程的名字，算是比较直接了当的问题解决手法了。  
+重新启动两个终端，设置断点在syscall处，然后运行到有误的行，此时输入`(gdb) p p->name`，可以得到输出`"initcode\000\000\000\000\000\000\000"`，表明当前的进程名为initcode。  
+阅读xv6源码可以了解到initcode实际上是系统启动后运行的第一个进程，负责各项资源的初始化。  
+问题中还要求了解该进程的pid（~~虽然但是，作为第一个进程pid肯定是1啊~~），直接输入`p *p`打印process变量即可看到pid为1。  
+至此这个pid的使用教程终于是结束了。  
+（往下面做之前记得把syscall改回来）  
+***
+#### System call tracing  
+第一次直接修改xv6的内核内容，以下跟着Lab2的说明文档一步一步来。  
+本部分的源码（仅大幅度修改的文件有源码，一点点语句添加在下方直接说明了）在trace文件夹中。  
+由于代码的修改比较杂乱，所以我额外将总代码的拷贝放在了[该repository](https://github.com/cre185/xv6_labs_solution)。  
+##### 添加syscall  
+新建文件和修改Makefile这些无需多言，但这样操作后并不能成功运行系统，这是由于系统在很多地方找不到该系统调用的定义。需要进行如下修改：  
+* 添加`int trace(int);`声明至`user.h`文件中；  
+* 添加`entry("trace");`至`usys.pl`中；  
+* 添加`#define SYS_trace  22`至`syscall.h`中。  
+在修改过后，usys.pl生成的汇编文件中也会包含trace作为syscall，连接问题解决，系统可以正常使用。  
+##### sysproc实现  
+上面的操作让系统认识到该函数的存在，下面一个个进行必要的修改。  
+先要添加一个统一格式的函数声明于`sysproc.c`文件中，具体参照源文件。  
+关于该函数的实现，文档中提及可以利用`proc.h`中的proc结构体，顾名思义该结构体存储了一个进程的相关信息，而trace的本质其实就是在进程中添加执行前输出自身情况的功能，可以在进程结构体中添加一个标志trace情况的变量mask，当进程执行时检查mask判断是否需要进行trace输出即可。  
+思路有了，实现起来也很简单，在sysproc文件中找点已有的函数作为示例可以发现使用`argint(0, &mask)`读取一个数值参数，该参数即为需要设置的mask。  
+接下来修改本进程的mask，通过`myproc()`函数获取proc对象后将其mask设置为读到的参数即可。  
+##### proc  
+上文中我们已经讨论过了对proc进行的修改，在其中加入`int mask;`即达成目的。  
+##### fork修改  
+文档中专门强调了对fork函数需要进行修改，以使得新创建的进程中的mask变量也得到正确维护。  
+这一步也简单，在fork函数中的np创建之后（也即紧贴`np->sz=p->sz`之后即可）加入`np->mask=p->mask;`。
+##### syscall修改
+在`syscall.c`中进行修改，在上面仿照原本的样式添加`extern uint64 sys_trace(void);`声明，下方的数组中也加入`[SYS_trace]   sys_trace,`，然后对syscall函数进行修改，具体参照源文件。  
+由于xv6中没有syscall的函数名相关的定义，因此此处直接声明了一个数组用于将编号与syscall名称对应。  
+另外一个要点是关于mask的判定，由于只需要取出mask对应二进制数字的第num位，故采用位运算方式，移动num位之后取%2即得该位数字。  
+测试可以通过`./grade-lab-syscall trace`开始。  
+***
+#### Sysinfo  
+该函数的功能为输出关于正在运行的系统的信息。  
+本部分源码在sysinfo文件夹中。  
+##### syscall  
+和上面的任务一样，该函数也将被实现为一个syscall函数，故仍需添加定义等部分，此处仅简单列举一下修改的文件：  
+* `Makefile`
+* `syscall.h`  
+* `syscall.c`  
+* `usys.pl`  
+* `sysproc.c` 这个文件中暂时加入空函数，仅有一句`retunr 0;`使编译通过  
+此外还有`user.h`，这个文件被单独说明是由于该文件中还要添加`struct sysinfo`结构体的声明，以作为下面函数调用中的参数类型。  
+修改完成后应该可以正常启动xv6系统，但在执行sysinfotest时不会得到正确结果。  
+##### 实现原理  
+在xv6内核中有sysinfo这个结构体，我们要做的只是获取一个sysinfo的拷贝，根据文档的提示，在`sysfile.c`中找到函数`sys_fstat()`，其中又引用了filestat函数，该函数位于`file.c`中，观察例子可以了解到copyout函数的用法，该函数正满足需求。  
+接下来还有两个问题，分别是获取剩余空间总量以及当前进程总数，这两个功能在下面实现时具体讨论。  
+##### sysproc  
+先来对sysproc进行实现，该函数接受一个指向sysinfo的指针作为参数，读取该参数时需使用argaddr函数，关于参数的读取可见`syscall.c`中的注释，之后不再赘述。  
+该函数还需要两个值来进行输出，也就是上面提到的两个问题，此处先写好函数调用，然后假设获取到了两个值，将它们拷贝到sysinfo变量中。  
+接下来仿照filestat函数的实现部分，创建proc并调用copyout（复制过来之后给参数改好名称）即可。  
+##### kalloc修改  
+问题一：获取剩余自由空间总量  
+两个问题分别通过函数进行实现，声明可以统一放置于`defs.h`中，此文件专门用于存储声明用于调用。  
+前面的任务中我们其实了解过xv6的页表机制，对于进程而言，获取内存就是获取页表的过程，故我们只需要获取页表的数量，然后乘以页表大小即可。之前的文档中提到了xv6页表大小为4096b，4kb大小。  
+此处的函数设计可以参考同一文件中的函数，可以了解到流程大概为：`run* r -> acquire lock -> use r -> release lock`。  
+其余部分照猫画虎即可，关键在于如何使用run对象，阅读[还是上面的文档](https://th0ar.gitbooks.io/xv6-chinese/content/content/chapter2.html)可知run的实现是一个链表，其储存了所有的空余链表，而我们拿到的对象是该链表的表头，用一个循环统计链表中的元素数量即可。  
+##### proc修改  
+问题二：获取process总数  
+此处碰到的情形意外地和上面有些许相似，框架部分照抄上面已有的函数，对象此处改为了利用proc，proc则是一个进程数组中的一员，统计数量仍然只需要一个循环即可。  
+有一点需要注意的是，proc中的所有进程中包含UNUSED进程，进程的状态情况可以参考[此文章](https://www.cnblogs.com/hehao98/p/10603045.html)，UNUSED进程实际上并没有被分配，也即是系统初始化时一次性全部创建出来的，统计时进行判断排除此类型的进程即可。  
+至此Lab 2的任务全部完成。  
