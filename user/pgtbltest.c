@@ -34,17 +34,11 @@ ugetpid_test()
   testname = "ugetpid_test";
   
   for (i = 0; i < 64; i++) {
-    printf("1\n");
     int ret = fork();
-    printf("%d\n",ret);
     if (ret != 0) {
-      printf("m\n");
       wait(&ret);
-      printf("w\n");
-      if (ret != 0){
-        printf("f\n");
+      if (ret != 0)
         exit(1);
-        }
       continue;
     }
     if (getpid() != ugetpid())
